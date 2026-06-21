@@ -185,32 +185,33 @@ spec:
 EOF
       emit_delay
 
-      name="$(resource_name "node-bandwidth-$source_node-to-$target_node")"
-      cat <<EOF
----
-apiVersion: chaos-mesh.org/v1alpha1
-kind: NetworkChaos
-EOF
-      emit_metadata "$name" "$workload_namespace"
-      cat <<EOF
-spec:
-  action: bandwidth
-  mode: all
-  selector:
-    namespaces:
-      - $workload_namespace
-    nodes:
-      - $source_node
-  direction: to
-  target:
-    mode: all
-    selector:
-      namespaces:
-        - $workload_namespace
-      nodes:
-        - $target_node
-EOF
-      emit_bandwidth
+      # Bandwidth restriction disabled — re-enable when bandwidth chaos is needed
+      # name="$(resource_name "node-bandwidth-$source_node-to-$target_node")"
+      # cat <<'_EOF'
+      # ---
+      # apiVersion: chaos-mesh.org/v1alpha1
+      # kind: NetworkChaos
+      # _EOF
+      # emit_metadata "$name" "$workload_namespace"
+      # cat <<_EOF
+      # spec:
+      #   action: bandwidth
+      #   mode: all
+      #   selector:
+      #     namespaces:
+      #       - $workload_namespace
+      #     nodes:
+      #       - $source_node
+      #   direction: to
+      #   target:
+      #     mode: all
+      #     selector:
+      #       namespaces:
+      #         - $workload_namespace
+      #       nodes:
+      #         - $target_node
+      # _EOF
+      # emit_bandwidth
     done
   done
 
@@ -251,6 +252,31 @@ spec:
     - $target_ip
 EOF
       emit_delay
+
+      # Bandwidth restriction disabled — re-enable when bandwidth chaos is needed
+      # name="$(resource_name "observer-bandwidth-$source_node-to-$target_node")"
+      # cat <<'_EOF'
+      # ---
+      # apiVersion: chaos-mesh.org/v1alpha1
+      # kind: NetworkChaos
+      # _EOF
+      # emit_metadata "$name" "$observer_namespace"
+      # cat <<_EOF
+      # spec:
+      #   action: bandwidth
+      #   mode: all
+      #   selector:
+      #     namespaces:
+      #       - $observer_namespace
+      #     nodes:
+      #       - $source_node
+      #     labelSelectors:
+      #       $observer_label_key: $observer_label_value
+      #   direction: to
+      #   externalTargets:
+      #     - $target_ip
+      # _EOF
+      # emit_bandwidth
     done
   done
 }
