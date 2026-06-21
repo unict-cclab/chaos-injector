@@ -251,30 +251,6 @@ spec:
     - $target_ip
 EOF
       emit_delay
-
-      name="$(resource_name "observer-bandwidth-$source_node-to-$target_node")"
-      cat <<EOF
----
-apiVersion: chaos-mesh.org/v1alpha1
-kind: NetworkChaos
-EOF
-      emit_metadata "$name" "$observer_namespace"
-      cat <<EOF
-spec:
-  action: bandwidth
-  mode: all
-  selector:
-    namespaces:
-      - $observer_namespace
-    nodes:
-      - $source_node
-    labelSelectors:
-      $observer_label_key: $observer_label_value
-  direction: to
-  externalTargets:
-    - $target_ip
-EOF
-      emit_bandwidth
     done
   done
 }
