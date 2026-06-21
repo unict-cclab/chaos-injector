@@ -6,6 +6,7 @@ default_manifest="${CHAOS_MANIFEST:-$script_dir/node-latency-chaos.yaml}"
 kubectl_bin="${KUBECTL:-kubectl}"
 workload_namespace="${WORKLOAD_NAMESPACE:-default}"
 node_group_label="${NODE_GROUP_LABEL:-topology.kubernetes.io/zone}"
+node_selector="${NODE_SELECTOR:-}"
 cross_zone_latency="${CROSS_ZONE_LATENCY:-50ms}"
 cross_zone_bandwidth="${CROSS_ZONE_BANDWIDTH:-10mbps}"
 bandwidth_limit="${BANDWIDTH_LIMIT:-20971520}"
@@ -116,8 +117,12 @@ write_manifest() {
   fi
 
   node_template='{{range .items}}{{.metadata.name}}{{"\t"}}{{range .status.addresses}}{{if eq .type "InternalIP"}}{{.address}}{{end}}{{end}}{{"\t"}}{{index .metadata.labels "'"$node_group_label"'"}}{{"\n"}}{{end}}'
+  local selector_args=()
+  if [[ -n "$node_selector" ]]; then
+    selector_args=(-l "$node_selector")
+  fi
   mapfile -t nodes < <(
-    "$kubectl_bin" get nodes -o "go-template=$node_template" |
+    "$kubectl_bin" get nodes "${selector_args[@]}" -o "go-template=$node_template" |
       sort
   )
 
