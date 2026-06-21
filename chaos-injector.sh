@@ -4,20 +4,14 @@ set -euo pipefail
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 default_manifest="${CHAOS_MANIFEST:-$script_dir/node-latency-chaos.yaml}"
 kubectl_bin="${KUBECTL:-kubectl}"
-workload_namespace="${WORKLOAD_NAMESPACE:-default}"
+chaos_namespace="${CHAOS_NAMESPACE:-chaos-mesh}"
+chaos_daemon_image="${CHAOS_DAEMON_IMAGE:-ghcr.io/chaos-mesh/chaos-daemon:v2.7.1}"
 node_group_label="${NODE_GROUP_LABEL:-topology.kubernetes.io/zone}"
 node_selector="${NODE_SELECTOR:-}"
+network_interface="${NETWORK_INTERFACE:-flannel.1}"
 cross_zone_latency="${CROSS_ZONE_LATENCY:-50ms}"
-cross_zone_bandwidth="${CROSS_ZONE_BANDWIDTH:-10mbps}"
-bandwidth_limit="${BANDWIDTH_LIMIT:-20971520}"
-bandwidth_buffer="${BANDWIDTH_BUFFER:-10000}"
 jitter="${JITTER:-0ms}"
 correlation="${CORRELATION:-0}"
-
-# Set OBSERVER_NAMESPACE to an empty string to omit observer traffic rules.
-observer_namespace="${OBSERVER_NAMESPACE-observability}"
-observer_label_key="${OBSERVER_LABEL_KEY:-app}"
-observer_label_value="${OBSERVER_LABEL_VALUE:-mentat}"
 
 usage() {
   cat <<EOF
@@ -28,9 +22,9 @@ Usage:
   $(basename "$0") delete [MANIFEST ...]
 
 Commands:
-  generate  Generate a cluster-specific Chaos Mesh manifest.
+  generate  Generate cluster-specific node-shaping DaemonSets.
   deploy    Generate a manifest and immediately apply it.
-  apply     Apply one or more generated manifests to the current cluster.
+  apply     Apply one or more generated manifests.
   delete    Delete resources defined by one or more generated manifests.
 
 The default manifest is:
@@ -68,55 +62,117 @@ resource_name() {
   printf '%s-%s' "${name:0:54}" "$hash"
 }
 
-emit_delay() {
-  cat <<EOF
-  delay:
-    latency: "$cross_zone_latency"
-    jitter: "$jitter"
-    correlation: "$correlation"
-EOF
-}
+write_daemonset() {
+  local source_node="$1"
+  local source_group="$2"
+  shift 2
+  local target_cidrs=("$@")
+  local name
+  name="$(resource_name "node-delay-$source_node")"
 
-emit_bandwidth() {
   cat <<EOF
-  bandwidth:
-    rate: "$cross_zone_bandwidth"
-    limit: $bandwidth_limit
-    buffer: $bandwidth_buffer
-EOF
-}
-
-emit_metadata() {
-  local name="$1"
-  local namespace="$2"
-  cat <<EOF
+---
+apiVersion: apps/v1
+kind: DaemonSet
 metadata:
   name: $name
-  namespace: $namespace
+  namespace: $chaos_namespace
   labels:
     app.kubernetes.io/name: node-latency-chaos
     app.kubernetes.io/managed-by: node-latency-chaos-injector
+    chaos-injector/source-node: $source_node
+    chaos-injector/source-group: $source_group
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: $name
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: $name
+        app.kubernetes.io/managed-by: node-latency-chaos-injector
+    spec:
+      hostPID: true
+      nodeSelector:
+        kubernetes.io/hostname: $source_node
+      tolerations:
+        - operator: Exists
+      terminationGracePeriodSeconds: 15
+      containers:
+        - name: node-shaper
+          image: $chaos_daemon_image
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            privileged: true
+          env:
+            - name: NETWORK_INTERFACE
+              value: "$network_interface"
+            - name: LATENCY
+              value: "$cross_zone_latency"
+            - name: JITTER
+              value: "$jitter"
+            - name: CORRELATION
+              value: "$correlation"
+          command:
+            - /bin/sh
+            - -ec
+          args:
+            - |
+              host() { nsenter -t 1 -n -- "\$@"; }
+              cleanup() {
+                if host tc qdisc show dev "\$NETWORK_INTERFACE" | grep -q '^qdisc prio 1:'; then
+                  host tc qdisc del dev "\$NETWORK_INTERFACE" root 2>/dev/null || true
+                fi
+              }
+              cleanup_and_exit() {
+                cleanup
+                exit 0
+              }
+              trap cleanup_and_exit INT TERM
+              existing_qdisc="\$(host tc qdisc show dev "\$NETWORK_INTERFACE")"
+              case "\$existing_qdisc" in
+                *"qdisc noqueue 0:"*|*"qdisc prio 1:"*) ;;
+                *)
+                  echo "refusing to replace existing qdisc on \$NETWORK_INTERFACE: \$existing_qdisc" >&2
+                  exit 1
+                  ;;
+              esac
+              cleanup
+              host tc qdisc add dev "\$NETWORK_INTERFACE" root handle 1: prio bands 3
+              host tc qdisc add dev "\$NETWORK_INTERFACE" parent 1:3 handle 30: netem \
+                delay "\$LATENCY" "\$JITTER" "\${CORRELATION%%%}%"
+EOF
+  local cidr
+  for cidr in "${target_cidrs[@]}"; do
+    cat <<EOF
+              host tc filter add dev "\$NETWORK_INTERFACE" protocol ip parent 1:0 \
+                prio 3 u32 match ip dst "$cidr" flowid 1:3
+EOF
+  done
+  cat <<'EOF'
+              while :; do
+                sleep 3600 &
+                wait $!
+              done
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -ec
+                - nsenter -t 1 -n -- tc qdisc show dev "$NETWORK_INTERFACE" | grep -q 'qdisc netem 30:'
+            initialDelaySeconds: 1
+            periodSeconds: 2
 EOF
 }
 
 write_manifest() {
   local node_template
-  local node_entry node_name node_ip node_group
+  local node_entry node_name node_ip pod_cidr node_group
   local source_entry source_node source_group
-  local target_entry target_node target_ip target_group
-  local name
-  local -a nodes
+  local target_entry target_node target_cidr target_group
+  local -a nodes target_cidrs
 
-  if [[ ! "$bandwidth_limit" =~ ^[1-9][0-9]*$ || "$bandwidth_limit" -gt 4294967295 ]]; then
-    echo "BANDWIDTH_LIMIT must be an integer between 1 and 4294967295" >&2
-    return 1
-  fi
-  if [[ ! "$bandwidth_buffer" =~ ^[1-9][0-9]*$ || "$bandwidth_buffer" -gt 4294967295 ]]; then
-    echo "BANDWIDTH_BUFFER must be an integer between 1 and 4294967295" >&2
-    return 1
-  fi
-
-  node_template='{{range .items}}{{.metadata.name}}{{"\t"}}{{range .status.addresses}}{{if eq .type "InternalIP"}}{{.address}}{{end}}{{end}}{{"\t"}}{{index .metadata.labels "'"$node_group_label"'"}}{{"\n"}}{{end}}'
+  node_template='{{range .items}}{{.metadata.name}}{{"\t"}}{{range .status.addresses}}{{if eq .type "InternalIP"}}{{.address}}{{end}}{{end}}{{"\t"}}{{.spec.podCIDR}}{{"\t"}}{{index .metadata.labels "'"$node_group_label"'"}}{{"\n"}}{{end}}'
   local selector_args=()
   if [[ -n "$node_selector" ]]; then
     selector_args=(-l "$node_selector")
@@ -127,14 +183,18 @@ write_manifest() {
   )
 
   if [[ "${#nodes[@]}" -lt 2 ]]; then
-    echo "expected at least two Kubernetes nodes" >&2
+    echo "expected at least two selected Kubernetes nodes" >&2
     return 1
   fi
 
   for node_entry in "${nodes[@]}"; do
-    IFS=$'\t' read -r node_name node_ip node_group <<<"$node_entry"
+    IFS=$'\t' read -r node_name node_ip pod_cidr node_group <<<"$node_entry"
     if [[ -z "$node_ip" ]]; then
       echo "node $node_name has no InternalIP" >&2
+      return 1
+    fi
+    if [[ -z "$pod_cidr" || "$pod_cidr" == "<no value>" ]]; then
+      echo "node $node_name has no PodCIDR" >&2
       return 1
     fi
     if [[ -z "$node_group" || "$node_group" == "<no value>" ]]; then
@@ -145,139 +205,22 @@ write_manifest() {
 
   echo "# Generated by chaos-injector/chaos-injector.sh"
   echo "# Node groups: $node_group_label"
-  echo "# Cross-zone latency: $cross_zone_latency jitter=$jitter correlation=$correlation"
-  echo "# Cross-zone bandwidth: $cross_zone_bandwidth limit=$bandwidth_limit buffer=$bandwidth_buffer"
-  echo "# Workload namespace: $workload_namespace"
+  echo "# Cross-group one-way latency: $cross_zone_latency jitter=$jitter correlation=$correlation"
+  echo "# Shaped interface: $network_interface"
 
   for source_entry in "${nodes[@]}"; do
-    IFS=$'\t' read -r source_node _ source_group <<<"$source_entry"
+    IFS=$'\t' read -r source_node _ _ source_group <<<"$source_entry"
+    target_cidrs=()
     for target_entry in "${nodes[@]}"; do
-      IFS=$'\t' read -r target_node _ target_group <<<"$target_entry"
+      IFS=$'\t' read -r target_node _ target_cidr target_group <<<"$target_entry"
       if [[ "$source_node" == "$target_node" || "$source_group" == "$target_group" ]]; then
         continue
       fi
-
-      name="$(resource_name "node-delay-$source_node-to-$target_node")"
-
-      cat <<EOF
----
-apiVersion: chaos-mesh.org/v1alpha1
-kind: NetworkChaos
-EOF
-      emit_metadata "$name" "$workload_namespace"
-      cat <<EOF
-spec:
-  action: delay
-  mode: all
-  selector:
-    namespaces:
-      - $workload_namespace
-    nodes:
-      - $source_node
-  direction: to
-  target:
-    mode: all
-    selector:
-      namespaces:
-        - $workload_namespace
-      nodes:
-        - $target_node
-EOF
-      emit_delay
-
-      # Bandwidth restriction disabled — re-enable when bandwidth chaos is needed
-      # name="$(resource_name "node-bandwidth-$source_node-to-$target_node")"
-      # cat <<'_EOF'
-      # ---
-      # apiVersion: chaos-mesh.org/v1alpha1
-      # kind: NetworkChaos
-      # _EOF
-      # emit_metadata "$name" "$workload_namespace"
-      # cat <<_EOF
-      # spec:
-      #   action: bandwidth
-      #   mode: all
-      #   selector:
-      #     namespaces:
-      #       - $workload_namespace
-      #     nodes:
-      #       - $source_node
-      #   direction: to
-      #   target:
-      #     mode: all
-      #     selector:
-      #       namespaces:
-      #         - $workload_namespace
-      #       nodes:
-      #         - $target_node
-      # _EOF
-      # emit_bandwidth
+      target_cidrs+=("$target_cidr")
     done
-  done
-
-  if [[ -z "$observer_namespace" ]]; then
-    return
-  fi
-
-  echo "# Observer namespace: $observer_namespace ($observer_label_key=$observer_label_value)"
-  for source_entry in "${nodes[@]}"; do
-    IFS=$'\t' read -r source_node _ source_group <<<"$source_entry"
-    for target_entry in "${nodes[@]}"; do
-      IFS=$'\t' read -r target_node target_ip target_group <<<"$target_entry"
-      if [[ "$source_node" == "$target_node" || "$source_group" == "$target_group" ]]; then
-        continue
-      fi
-
-      name="$(resource_name "observer-delay-$source_node-to-$target_node")"
-
-      cat <<EOF
----
-apiVersion: chaos-mesh.org/v1alpha1
-kind: NetworkChaos
-EOF
-      emit_metadata "$name" "$observer_namespace"
-      cat <<EOF
-spec:
-  action: delay
-  mode: all
-  selector:
-    namespaces:
-      - $observer_namespace
-    nodes:
-      - $source_node
-    labelSelectors:
-      $observer_label_key: $observer_label_value
-  direction: to
-  externalTargets:
-    - $target_ip
-EOF
-      emit_delay
-
-      # Bandwidth restriction disabled — re-enable when bandwidth chaos is needed
-      # name="$(resource_name "observer-bandwidth-$source_node-to-$target_node")"
-      # cat <<'_EOF'
-      # ---
-      # apiVersion: chaos-mesh.org/v1alpha1
-      # kind: NetworkChaos
-      # _EOF
-      # emit_metadata "$name" "$observer_namespace"
-      # cat <<_EOF
-      # spec:
-      #   action: bandwidth
-      #   mode: all
-      #   selector:
-      #     namespaces:
-      #       - $observer_namespace
-      #     nodes:
-      #       - $source_node
-      #     labelSelectors:
-      #       $observer_label_key: $observer_label_value
-      #   direction: to
-      #   externalTargets:
-      #     - $target_ip
-      # _EOF
-      # emit_bandwidth
-    done
+    if [[ "${#target_cidrs[@]}" -gt 0 ]]; then
+      write_daemonset "$source_node" "$source_group" "${target_cidrs[@]}"
+    fi
   done
 }
 
@@ -308,7 +251,19 @@ deploy() {
   fi
 
   generate "$manifest"
+  "$kubectl_bin" delete daemonset \
+    -n "$chaos_namespace" \
+    -l app.kubernetes.io/managed-by=node-latency-chaos-injector \
+    --ignore-not-found=true --wait=true
+  "$kubectl_bin" delete networkchaos \
+    --all-namespaces \
+    -l app.kubernetes.io/managed-by=node-latency-chaos-injector \
+    --ignore-not-found=true --wait=true
   apply_manifests "$manifest"
+  "$kubectl_bin" rollout status daemonset \
+    -n "$chaos_namespace" \
+    -l app.kubernetes.io/managed-by=node-latency-chaos-injector \
+    --timeout=2m
 }
 
 apply_manifests() {
@@ -331,8 +286,12 @@ delete_manifests() {
 
   for manifest in "${manifests[@]}"; do
     require_manifest "$manifest"
-    "$kubectl_bin" delete --ignore-not-found=true -f "$manifest"
+    "$kubectl_bin" delete --ignore-not-found=true --wait=true -f "$manifest"
   done
+  "$kubectl_bin" delete networkchaos \
+    --all-namespaces \
+    -l app.kubernetes.io/managed-by=node-latency-chaos-injector \
+    --ignore-not-found=true --wait=true
 }
 
 command="${1:-}"

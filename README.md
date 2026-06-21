@@ -1,100 +1,90 @@
-# Cross-Zone Network Chaos Injector
+# Cross-Zone Node Latency Injector
 
-This tool generates Chaos Mesh `NetworkChaos` resources that model node
-proximity. Nodes carrying the same topology label value are considered part of
-the same zone. Traffic between different zones receives both additional
-latency and a bandwidth limit; traffic inside a zone is unchanged.
+This tool models network proximity between Kubernetes nodes. Nodes carrying the
+same topology label value are treated as one group. Traffic to PodCIDRs owned by
+nodes in another group receives additional latency; traffic within a group is
+unchanged.
 
-By default, the injector uses Kubernetes' standard
-`topology.kubernetes.io/zone` node label. It selects all workload pods in the
-configured namespace, so applications do not need a special `group` label.
+The generated manifest contains one privileged, node-pinned DaemonSet for each
+selected source node. Each shaper installs `tc/netem` filters in the host network
+namespace and remains effective when application pods scale, restart, or move.
+
+The shaper image defaults to the Chaos Mesh daemon image, reusing its audited
+`tc` and `nsenter` tooling. This implementation does not create `NetworkChaos`
+resources because those inject into selected pod network namespaces and do not
+cover replacement pods automatically.
 
 ## Prerequisites
 
-- A Kubernetes cluster with Chaos Mesh installed
-- `kubectl` configured for that cluster
-- At least two nodes, each with an InternalIP and the topology label
+- A Kubernetes cluster using Flannel VXLAN, or another CNI with a routable
+  interface for remote PodCIDRs
+- `kubectl` configured for the cluster
+- Chaos Mesh's daemon image available to cluster nodes
+- At least two selected nodes with an InternalIP, PodCIDR, and topology label
 
 For example:
 
 ```bash
-kubectl label node node-a topology.kubernetes.io/zone=near-1
-kubectl label node node-b topology.kubernetes.io/zone=near-1
-kubectl label node node-c topology.kubernetes.io/zone=near-2
+kubectl label node node-a topology.kubernetes.io/zone=zone-a
+kubectl label node node-b topology.kubernetes.io/zone=zone-a
+kubectl label node node-c topology.kubernetes.io/zone=zone-b
 ```
 
-Here, traffic between `node-a` and `node-b` is unchanged. Traffic between
-either of them and `node-c` receives `CROSS_ZONE_LATENCY` and is limited to
-`CROSS_ZONE_BANDWIDTH`.
+Traffic between `node-a` and `node-b` is unchanged. Traffic between either node
+and `node-c` receives `CROSS_ZONE_LATENCY` in each configured direction.
 
-Chaos Mesh represents delay and bandwidth shaping as separate actions, so the
-generated manifest contains two `NetworkChaos` resources for each directed
-cross-zone node pair.
+`NODE_SELECTOR` defines the complete shaping boundary. When it is set to
+`nodepool=app`, shapers run only on application nodes and filters contain only
+PodCIDRs belonging to other `nodepool=app` nodes. Traffic between application
+nodes and control-plane, management, or other unselected nodes is not shaped.
 
-## Usage
-
-The `chaos-injector.sh` entry point manages the complete manifest lifecycle.
-Without a path, all commands use `node-latency-chaos.yaml` in this directory.
-
-Generate and apply the manifest in one command:
+The selector can narrow the experiment to an exact pair. Provided the nodes
+belong to different groups, this shapes only `node-a` and `node-c`:
 
 ```bash
-CROSS_ZONE_LATENCY=50ms CROSS_ZONE_BANDWIDTH=10mbps \
+NODE_SELECTOR='kubernetes.io/hostname in (node-a,node-c)' \
   ./chaos-injector.sh deploy
 ```
 
-Generate the manifest:
+## Usage
+
+Generate and apply the manifest, then wait for all node shapers to become ready:
 
 ```bash
-CROSS_ZONE_LATENCY=50ms CROSS_ZONE_BANDWIDTH=10mbps \
-  ./chaos-injector.sh generate
+CROSS_ZONE_LATENCY=100ms ./chaos-injector.sh deploy
 ```
 
-Apply it:
+Generate, apply, or delete separately:
 
 ```bash
+./chaos-injector.sh generate
 ./chaos-injector.sh apply
-```
-
-Delete its resources:
-
-```bash
 ./chaos-injector.sh delete
 ```
 
-Each command also accepts an explicit path. `deploy` generates and applies one
-manifest, while `apply` and `delete` can process multiple manifests:
-
-```bash
-./chaos-injector.sh deploy /tmp/cluster-a-chaos.yaml
-./chaos-injector.sh generate /tmp/cluster-a-chaos.yaml
-./chaos-injector.sh apply /tmp/cluster-a-chaos.yaml /tmp/cluster-b-chaos.yaml
-./chaos-injector.sh delete /tmp/cluster-a-chaos.yaml /tmp/cluster-b-chaos.yaml
-```
+Each command accepts an explicit manifest path. `apply` and `delete` can process
+multiple manifests.
 
 ## Configuration
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `WORKLOAD_NAMESPACE` | `default` | Namespace whose pods receive cross-zone network chaos |
 | `NODE_GROUP_LABEL` | `topology.kubernetes.io/zone` | Node label defining proximity groups |
-| `CROSS_ZONE_LATENCY` | `50ms` | Added latency between nodes in different zones |
-| `CROSS_ZONE_BANDWIDTH` | `10mbps` | Bandwidth rate between nodes in different zones |
-| `BANDWIDTH_LIMIT` | `20971520` | Maximum bytes queued by the bandwidth shaper |
-| `BANDWIDTH_BUFFER` | `10000` | Maximum bytes sent instantaneously by the bandwidth shaper |
-| `JITTER` | `0ms` | Chaos Mesh delay jitter |
-| `CORRELATION` | `0` | Chaos Mesh delay correlation |
+| `NODE_SELECTOR` | empty | Optional selector limiting shaped nodes, such as `nodepool=app` |
+| `CROSS_ZONE_LATENCY` | `50ms` | One-way delay applied toward nodes in other groups |
+| `JITTER` | `0ms` | Delay variation passed to `tc netem` |
+| `CORRELATION` | `0` | Delay correlation percentage, with or without `%` |
+| `NETWORK_INTERFACE` | `flannel.1` | Host interface carrying traffic toward remote PodCIDRs |
+| `CHAOS_NAMESPACE` | `chaos-mesh` | Namespace for the generated shaper DaemonSets |
+| `CHAOS_DAEMON_IMAGE` | `ghcr.io/chaos-mesh/chaos-daemon:v2.7.1` | Image providing `tc` and `nsenter` |
 | `KUBECTL` | `kubectl` | `kubectl` executable |
-| `CHAOS_MANIFEST` | `node-latency-chaos.yaml` beside the script | Default manifest used by lifecycle commands |
+| `CHAOS_MANIFEST` | `node-latency-chaos.yaml` beside the script | Default manifest path |
 
-The injector can also apply equivalent delay and bandwidth shaping to an
-observer pod that probes node InternalIP addresses. This is enabled by default
-for the existing Mentat setup and is configurable:
+The injector creates directed filters on every selected node. Consequently,
+`CROSS_ZONE_LATENCY=100ms` produces approximately 200 ms of additional
+cross-group round-trip time.
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `OBSERVER_NAMESPACE` | `observability` | Observer namespace; set to an empty string to disable |
-| `OBSERVER_LABEL_KEY` | `app` | Observer pod selector label key |
-| `OBSERVER_LABEL_VALUE` | `mentat` | Observer pod selector label value |
+Deleting the manifest terminates the shaper pods. Their termination handler
+removes the root qdisc installed by the injector.
 
-The generated manifest is cluster-specific and ignored by Git.
+The generated cluster-specific manifest is ignored by Git.
