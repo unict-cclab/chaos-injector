@@ -1,9 +1,9 @@
-# Cross-Zone Node Latency Injector
+# Cross-Zone Node Network Injector
 
 This tool models network proximity between Kubernetes nodes. Nodes carrying the
 same topology label value are treated as one group. Traffic to PodCIDRs owned by
-nodes in another group receives additional latency; traffic within a group is
-unchanged.
+nodes in another group can receive additional latency, packet loss, and/or a
+bandwidth limit; traffic within a group is unchanged.
 
 The generated manifest contains one privileged, node-pinned DaemonSet for each
 selected source node. Each shaper installs `tc/netem` filters in the host network
@@ -31,7 +31,7 @@ kubectl label node node-c topology.kubernetes.io/zone=zone-b
 ```
 
 Traffic between `node-a` and `node-b` is unchanged. Traffic between either node
-and `node-c` receives `CROSS_ZONE_LATENCY` in each configured direction.
+and `node-c` receives the enabled impairments in each configured direction.
 
 `NODE_SELECTOR` defines the complete shaping boundary. When it is set to
 `nodepool=app`, shapers run only on application nodes and filters contain only
@@ -51,7 +51,16 @@ NODE_SELECTOR='kubernetes.io/hostname in (node-a,node-c)' \
 Generate and apply the manifest, then wait for all node shapers to become ready:
 
 ```bash
-CROSS_ZONE_LATENCY=100ms ./chaos-injector.sh deploy
+ENABLE_LATENCY=true CROSS_ZONE_LATENCY=100ms ./chaos-injector.sh deploy
+```
+
+Enable bandwidth restriction and packet loss independently:
+
+```bash
+ENABLE_LATENCY=false \
+ENABLE_BANDWIDTH=true CROSS_ZONE_BANDWIDTH_BYTES_PER_SECOND=1250000 \
+ENABLE_PACKET_LOSS=true PACKET_LOSS=1 \
+  ./chaos-injector.sh deploy
 ```
 
 Generate, apply, or delete separately:
@@ -71,7 +80,12 @@ multiple manifests.
 | --- | --- | --- |
 | `NODE_GROUP_LABEL` | `topology.kubernetes.io/zone` | Node label defining proximity groups |
 | `NODE_SELECTOR` | empty | Optional selector limiting shaped nodes, such as `nodepool=app` |
+| `ENABLE_LATENCY` | `true` | Enables cross-group `tc netem delay` |
+| `ENABLE_BANDWIDTH` | `false` | Enables cross-group `tc netem rate` |
+| `ENABLE_PACKET_LOSS` | `false` | Enables cross-group `tc netem loss` |
 | `CROSS_ZONE_LATENCY` | `50ms` | One-way delay applied toward nodes in other groups |
+| `CROSS_ZONE_BANDWIDTH_BYTES_PER_SECOND` | empty | Bandwidth rate applied toward nodes in other groups when enabled, expressed in bytes per second |
+| `PACKET_LOSS` | `0` | Packet-loss percentage passed to `tc netem`, with or without `%` |
 | `JITTER` | `0ms` | Delay variation passed to `tc netem` |
 | `CORRELATION` | `0` | Delay correlation percentage, with or without `%` |
 | `NETWORK_INTERFACE` | `flannel.1` | Host interface carrying traffic toward remote PodCIDRs |
@@ -82,7 +96,12 @@ multiple manifests.
 
 The injector creates directed filters on every selected node. Consequently,
 `CROSS_ZONE_LATENCY=100ms` produces approximately 200 ms of additional
-cross-group round-trip time.
+cross-group round-trip time when latency injection is enabled.
+
+The impairments are applied by the same filtered `netem` qdisc. They only affect
+traffic matching the generated cross-group PodCIDR filters, but the measured
+effects are not independent: packet loss usually reduces TCP bandwidth, and
+bandwidth limits can increase latency under queueing.
 
 Deleting the manifest terminates the shaper pods. Their termination handler
 removes the root qdisc installed by the injector.

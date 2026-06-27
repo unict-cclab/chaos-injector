@@ -27,6 +27,10 @@ chmod +x "$fake_kubectl"
 KUBECTL="$fake_kubectl" \
 NODE_SELECTOR=nodepool=app \
 CROSS_ZONE_LATENCY=100ms \
+ENABLE_BANDWIDTH=true \
+CROSS_ZONE_BANDWIDTH_BYTES_PER_SECOND=1250000 \
+ENABLE_PACKET_LOSS=true \
+PACKET_LOSS=1 \
   "$repo_dir/chaos-injector.sh" generate "$manifest" >/dev/null
 
 [[ "$(grep -c '^kind: DaemonSet$' "$manifest")" -eq 4 ]]
@@ -34,6 +38,9 @@ CROSS_ZONE_LATENCY=100ms \
 app_01="$(sed -n '/name: node-delay-app-01$/,/^---$/p' "$manifest")"
 grep -q '10.42.3.0/24' <<<"$app_01"
 grep -q '10.42.4.0/24' <<<"$app_01"
+grep -q 'value: "1250000"' <<<"$app_01"
+grep -q 'value: "1"' <<<"$app_01"
+grep -q 'rate \${BANDWIDTH_BYTES_PER_SECOND}bps' <<<"$app_01"
 if grep -qE '10\.42\.[12]\.0/24' <<<"$app_01"; then
   echo "app-01 shaper unexpectedly targets a same-zone PodCIDR" >&2
   exit 1
