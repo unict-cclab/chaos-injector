@@ -7,6 +7,7 @@ trap 'rm -rf -- "$tmp_dir"' EXIT
 
 fake_kubectl="$tmp_dir/kubectl"
 manifest="$tmp_dir/node-shaping.yaml"
+host_manifest="$tmp_dir/host-network-shaping.yaml"
 
 cat >"$fake_kubectl" <<'EOF'
 #!/usr/bin/env bash
@@ -48,6 +49,22 @@ fi
 
 if grep -qE '10\.42\.(0|5)\.0/24' "$manifest"; then
   echo "manifest unexpectedly targets an unselected node PodCIDR" >&2
+  exit 1
+fi
+
+KUBECTL="$fake_kubectl" \
+NODE_SELECTOR=nodepool=app \
+NETWORK_INTERFACE=eth0 \
+HOST_NETWORK=true \
+  "$repo_dir/chaos-injector.sh" generate "$host_manifest" >/dev/null
+
+host_app_01="$(sed -n '/name: node-delay-app-01$/,/^---$/p' "$host_manifest")"
+grep -q 'value: "eth0"' <<<"$host_app_01"
+grep -q 'value: "true"' <<<"$host_app_01"
+grep -q '192.168.1.13/32' <<<"$host_app_01"
+grep -q '192.168.1.14/32' <<<"$host_app_01"
+if grep -q '10.42.' <<<"$host_app_01"; then
+  echo "host-network shaper unexpectedly targets a PodCIDR" >&2
   exit 1
 fi
 

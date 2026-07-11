@@ -9,6 +9,7 @@ chaos_daemon_image="${CHAOS_DAEMON_IMAGE:-ghcr.io/chaos-mesh/chaos-daemon:v2.7.1
 node_group_label="${NODE_GROUP_LABEL:-topology.kubernetes.io/zone}"
 node_selector="${NODE_SELECTOR:-}"
 network_interface="${NETWORK_INTERFACE:-flannel.1}"
+host_network="${HOST_NETWORK:-false}"
 enable_latency="${ENABLE_LATENCY:-true}"
 enable_bandwidth="${ENABLE_BANDWIDTH:-false}"
 enable_packet_loss="${ENABLE_PACKET_LOSS:-false}"
@@ -131,6 +132,8 @@ spec:
           env:
             - name: NETWORK_INTERFACE
               value: "$network_interface"
+            - name: HOST_NETWORK
+              value: "$host_network"
             - name: ENABLE_LATENCY
               value: "$enable_latency"
             - name: ENABLE_BANDWIDTH
@@ -180,6 +183,7 @@ spec:
                 netem_args="\$netem_args loss \${PACKET_LOSS%%%}%"
               fi
               if [ "\$ENABLE_BANDWIDTH" = "true" ]; then
+                # tc/iproute2 uses "bps" for bytes per second ("bit" is bits per second).
                 netem_args="\$netem_args rate \${BANDWIDTH_BYTES_PER_SECOND}bps"
               fi
               if [ -z "\$netem_args" ]; then
@@ -217,7 +221,7 @@ write_manifest() {
   local node_template
   local node_entry node_name node_ip pod_cidr node_group
   local source_entry source_node source_group
-  local target_entry target_node target_cidr target_group
+  local target_entry target_node target_ip target_cidr target_group target_network
   local -a nodes target_cidrs
 
   node_template='{{range .items}}{{.metadata.name}}{{"\t"}}{{range .status.addresses}}{{if eq .type "InternalIP"}}{{.address}}{{end}}{{end}}{{"\t"}}{{.spec.podCIDR}}{{"\t"}}{{index .metadata.labels "'"$node_group_label"'"}}{{"\n"}}{{end}}'
@@ -256,11 +260,13 @@ write_manifest() {
   enable_latency="$(bool_value "$enable_latency")"
   enable_bandwidth="$(bool_value "$enable_bandwidth")"
   enable_packet_loss="$(bool_value "$enable_packet_loss")"
+  host_network="$(bool_value "$host_network")"
   echo "# Enabled impairments: latency=$enable_latency bandwidth=$enable_bandwidth packet_loss=$enable_packet_loss"
   echo "# Cross-group latency: $cross_zone_latency jitter=$jitter correlation=$correlation"
   echo "# Cross-group bandwidth: ${cross_zone_bandwidth_bytes_per_second:-disabled} bytes/s"
   echo "# Cross-group packet loss: $packet_loss"
   echo "# Shaped interface: $network_interface"
+  echo "# Target network: $([[ "$host_network" == "true" ]] && printf 'node InternalIPs' || printf 'PodCIDRs')"
 
   if [[ "$enable_latency" != "true" && "$enable_bandwidth" != "true" && "$enable_packet_loss" != "true" ]]; then
     echo "at least one of ENABLE_LATENCY, ENABLE_BANDWIDTH, or ENABLE_PACKET_LOSS must be true" >&2
@@ -281,11 +287,16 @@ write_manifest() {
     IFS=$'\t' read -r source_node _ _ source_group <<<"$source_entry"
     target_cidrs=()
     for target_entry in "${nodes[@]}"; do
-      IFS=$'\t' read -r target_node _ target_cidr target_group <<<"$target_entry"
+      IFS=$'\t' read -r target_node target_ip target_cidr target_group <<<"$target_entry"
       if [[ "$source_node" == "$target_node" || "$source_group" == "$target_group" ]]; then
         continue
       fi
-      target_cidrs+=("$target_cidr")
+      if [[ "$host_network" == "true" ]]; then
+        target_network="$target_ip/32"
+      else
+        target_network="$target_cidr"
+      fi
+      target_cidrs+=("$target_network")
     done
     if [[ "${#target_cidrs[@]}" -gt 0 ]]; then
       write_daemonset "$source_node" "$source_group" "${target_cidrs[@]}"
