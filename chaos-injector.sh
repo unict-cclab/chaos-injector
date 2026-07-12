@@ -186,7 +186,12 @@ spec:
                   ;;
               esac
               cleanup
-              host tc qdisc add dev "\$NETWORK_INTERFACE" root handle 1: prio bands $((${#target_specs[@]} + 1))
+              # Keep all unmatched traffic (including same-zone traffic) in
+              # unshaped band 1. Destination filters below explicitly direct
+              # cross-zone traffic into shaped bands 2..N.
+              host tc qdisc add dev "\$NETWORK_INTERFACE" root handle 1: prio \
+                bands $((${#target_specs[@]} + 1)) \
+                priomap 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
 EOF
   local spec latency bandwidth rule_packet_loss cidrs cidr band=2 handle=20
   for spec in "${target_specs[@]}"; do

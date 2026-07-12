@@ -38,6 +38,7 @@ DEFAULT_CROSS_ZONE_PACKET_LOSS=1 \
 [[ "$(grep -c '^kind: DaemonSet$' "$manifest")" -eq 4 ]]
 
 app_01="$(sed -n '/name: node-delay-app-01$/,/^---$/p' "$manifest")"
+grep -q 'priomap 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0' <<<"$app_01"
 grep -q '10.42.3.0/24' <<<"$app_01"
 grep -q '10.42.4.0/24' <<<"$app_01"
 grep -q 'delay 15ms' <<<"$app_01"

@@ -39,7 +39,8 @@ manifest removes the installed traffic-control rules.
 `cloud>fog=20ms;12500000;0.1` customizes all supported impairments. Leave a
 field empty to inherit its corresponding `DEFAULT_CROSS_ZONE_*` value.
 Unlisted pairs inherit every global default. The injector creates a separate
-netem class per destination zone.
+netem class per destination zone. Same-zone and otherwise unmatched traffic
+stays in an explicit unshaped traffic-control band.
 The `ENABLE_LATENCY`, `ENABLE_BANDWIDTH`, and `ENABLE_PACKET_LOSS` switches
 remain feature-level gates; an override for a disabled impairment is retained
 in configuration but is not applied.
