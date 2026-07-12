@@ -13,11 +13,10 @@ host_network="${HOST_NETWORK:-false}"
 enable_latency="${ENABLE_LATENCY:-true}"
 enable_bandwidth="${ENABLE_BANDWIDTH:-false}"
 enable_packet_loss="${ENABLE_PACKET_LOSS:-false}"
-cross_zone_latency="${CROSS_ZONE_LATENCY:-50ms}"
-cross_zone_bandwidth_bytes_per_second="${CROSS_ZONE_BANDWIDTH_BYTES_PER_SECOND:-}"
-packet_loss="${PACKET_LOSS:-0}"
-jitter="${JITTER:-0ms}"
-correlation="${CORRELATION:-0}"
+default_cross_zone_latency="${DEFAULT_CROSS_ZONE_LATENCY:-50ms}"
+zone_links="${ZONE_LINKS:-}"
+default_cross_zone_bandwidth_bytes_per_second="${DEFAULT_CROSS_ZONE_BANDWIDTH_BYTES_PER_SECOND:-}"
+default_cross_zone_packet_loss="${DEFAULT_CROSS_ZONE_PACKET_LOSS:-0}"
 
 usage() {
   cat <<EOF
@@ -87,11 +86,33 @@ resource_name() {
   printf '%s-%s' "${name:0:54}" "$hash"
 }
 
+link_for_pair() {
+  local source_group="$1" target_group="$2" rule pair properties
+  local latency="$default_cross_zone_latency" bandwidth="$default_cross_zone_bandwidth_bytes_per_second" rule_packet_loss="$default_cross_zone_packet_loss"
+  local override_latency override_bandwidth override_packet_loss
+  if [[ -n "$zone_links" ]]; then
+    IFS=',' read -ra rules <<<"$zone_links"
+    for rule in "${rules[@]}"; do
+      pair="${rule%%=*}"
+      properties="${rule#*=}"
+      if [[ "$pair" == "$source_group>$target_group" ]]; then
+        [[ "$properties" != "$rule" ]] || return 2
+        IFS=';' read -r override_latency override_bandwidth override_packet_loss _ <<<"$properties;"
+        [[ -z "$override_latency" ]] || latency="$override_latency"
+        [[ -z "$override_bandwidth" ]] || bandwidth="$override_bandwidth"
+        [[ -z "$override_packet_loss" ]] || rule_packet_loss="$override_packet_loss"
+        break
+      fi
+    done
+  fi
+  printf '%s|%s|%s' "$latency" "$bandwidth" "$rule_packet_loss"
+}
+
 write_daemonset() {
   local source_node="$1"
   local source_group="$2"
   shift 2
-  local target_cidrs=("$@")
+  local target_specs=("$@")
   local name
   name="$(resource_name "node-delay-$source_node")"
 
@@ -140,16 +161,6 @@ spec:
               value: "$enable_bandwidth"
             - name: ENABLE_PACKET_LOSS
               value: "$enable_packet_loss"
-            - name: LATENCY
-              value: "$cross_zone_latency"
-            - name: BANDWIDTH_BYTES_PER_SECOND
-              value: "$cross_zone_bandwidth_bytes_per_second"
-            - name: PACKET_LOSS
-              value: "$packet_loss"
-            - name: JITTER
-              value: "$jitter"
-            - name: CORRELATION
-              value: "$correlation"
           command:
             - /bin/sh
             - -ec
@@ -175,31 +186,35 @@ spec:
                   ;;
               esac
               cleanup
-              netem_args=""
+              host tc qdisc add dev "\$NETWORK_INTERFACE" root handle 1: prio bands $((${#target_specs[@]} + 1))
+EOF
+  local spec latency bandwidth rule_packet_loss cidrs cidr band=2 handle=20
+  for spec in "${target_specs[@]}"; do
+    IFS='|' read -r latency bandwidth rule_packet_loss cidrs <<<"$spec"
+    cat <<EOF
+              rule_args=""
               if [ "\$ENABLE_LATENCY" = "true" ]; then
-                netem_args="\$netem_args delay \$LATENCY \$JITTER \${CORRELATION%%%}%"
+                rule_args="\$rule_args delay $latency"
               fi
               if [ "\$ENABLE_PACKET_LOSS" = "true" ]; then
-                netem_args="\$netem_args loss \${PACKET_LOSS%%%}%"
+                rule_args="\$rule_args loss ${rule_packet_loss%%%}%"
               fi
               if [ "\$ENABLE_BANDWIDTH" = "true" ]; then
                 # tc/iproute2 uses "bps" for bytes per second ("bit" is bits per second).
-                netem_args="\$netem_args rate \${BANDWIDTH_BYTES_PER_SECOND}bps"
+                rule_args="\$rule_args rate ${bandwidth}bps"
               fi
-              if [ -z "\$netem_args" ]; then
-                echo "no network impairment enabled" >&2
-                exit 1
-              fi
-              host tc qdisc add dev "\$NETWORK_INTERFACE" root handle 1: prio bands 3
               # shellcheck disable=SC2086
-              host tc qdisc add dev "\$NETWORK_INTERFACE" parent 1:3 handle 30: netem \$netem_args
+              host tc qdisc add dev "\$NETWORK_INTERFACE" parent 1:$band handle $handle: netem \$rule_args
 EOF
-  local cidr
-  for cidr in "${target_cidrs[@]}"; do
-    cat <<EOF
+    IFS=',' read -ra rule_cidrs <<<"$cidrs"
+    for cidr in "${rule_cidrs[@]}"; do
+      cat <<EOF
               host tc filter add dev "\$NETWORK_INTERFACE" protocol ip parent 1:0 \
-                prio 3 u32 match ip dst "$cidr" flowid 1:3
+                prio 3 u32 match ip dst "$cidr" flowid 1:$band
 EOF
+    done
+    band=$((band + 1))
+    handle=$((handle + 10))
   done
   cat <<'EOF'
               while :; do
@@ -211,7 +226,7 @@ EOF
               command:
                 - /bin/sh
                 - -ec
-                - nsenter -t 1 -n -- tc qdisc show dev "$NETWORK_INTERFACE" | grep -q 'qdisc netem 30:'
+                - nsenter -t 1 -n -- tc qdisc show dev "$NETWORK_INTERFACE" | grep -q 'qdisc netem'
             initialDelaySeconds: 1
             periodSeconds: 2
 EOF
@@ -221,8 +236,9 @@ write_manifest() {
   local node_template
   local node_entry node_name node_ip pod_cidr node_group
   local source_entry source_node source_group
-  local target_entry target_node target_ip target_cidr target_group target_network
-  local -a nodes target_cidrs
+  local target_entry target_node target_ip target_cidr target_group target_network target_latency
+  local -a nodes target_specs target_groups
+  local -A networks_by_group
 
   node_template='{{range .items}}{{.metadata.name}}{{"\t"}}{{range .status.addresses}}{{if eq .type "InternalIP"}}{{.address}}{{end}}{{end}}{{"\t"}}{{.spec.podCIDR}}{{"\t"}}{{index .metadata.labels "'"$node_group_label"'"}}{{"\n"}}{{end}}'
   local selector_args=()
@@ -262,9 +278,10 @@ write_manifest() {
   enable_packet_loss="$(bool_value "$enable_packet_loss")"
   host_network="$(bool_value "$host_network")"
   echo "# Enabled impairments: latency=$enable_latency bandwidth=$enable_bandwidth packet_loss=$enable_packet_loss"
-  echo "# Cross-group latency: $cross_zone_latency jitter=$jitter correlation=$correlation"
-  echo "# Cross-group bandwidth: ${cross_zone_bandwidth_bytes_per_second:-disabled} bytes/s"
-  echo "# Cross-group packet loss: $packet_loss"
+  echo "# Default cross-group latency: $default_cross_zone_latency"
+  [[ -z "$zone_links" ]] || echo "# Zone link overrides: $zone_links"
+  echo "# Default cross-group bandwidth: ${default_cross_zone_bandwidth_bytes_per_second:-disabled} bytes/s"
+  echo "# Default cross-group packet loss: $default_cross_zone_packet_loss"
   echo "# Shaped interface: $network_interface"
   echo "# Target network: $([[ "$host_network" == "true" ]] && printf 'node InternalIPs' || printf 'PodCIDRs')"
 
@@ -273,19 +290,21 @@ write_manifest() {
     return 1
   fi
   if [[ "$enable_bandwidth" == "true" ]]; then
-    if [[ -z "$cross_zone_bandwidth_bytes_per_second" ]]; then
-      echo "CROSS_ZONE_BANDWIDTH_BYTES_PER_SECOND is required when ENABLE_BANDWIDTH=true" >&2
+    if [[ -z "$default_cross_zone_bandwidth_bytes_per_second" ]]; then
+      echo "DEFAULT_CROSS_ZONE_BANDWIDTH_BYTES_PER_SECOND is required when ENABLE_BANDWIDTH=true" >&2
       return 1
     fi
-    if ! [[ "$cross_zone_bandwidth_bytes_per_second" =~ ^([1-9][0-9]*([.][0-9]+)?|0[.][0-9]*[1-9][0-9]*)$ ]]; then
-      echo "CROSS_ZONE_BANDWIDTH_BYTES_PER_SECOND must be a positive numeric bytes-per-second value" >&2
+    if ! [[ "$default_cross_zone_bandwidth_bytes_per_second" =~ ^([1-9][0-9]*([.][0-9]+)?|0[.][0-9]*[1-9][0-9]*)$ ]]; then
+      echo "DEFAULT_CROSS_ZONE_BANDWIDTH_BYTES_PER_SECOND must be a positive numeric bytes-per-second value" >&2
       return 1
     fi
   fi
 
   for source_entry in "${nodes[@]}"; do
     IFS=$'\t' read -r source_node _ _ source_group <<<"$source_entry"
-    target_cidrs=()
+    target_specs=()
+    target_groups=()
+    networks_by_group=()
     for target_entry in "${nodes[@]}"; do
       IFS=$'\t' read -r target_node target_ip target_cidr target_group <<<"$target_entry"
       if [[ "$source_node" == "$target_node" || "$source_group" == "$target_group" ]]; then
@@ -296,10 +315,26 @@ write_manifest() {
       else
         target_network="$target_cidr"
       fi
-      target_cidrs+=("$target_network")
+      if [[ -z "${networks_by_group[$target_group]+x}" ]]; then
+        target_groups+=("$target_group")
+        networks_by_group[$target_group]="$target_network"
+      else
+        networks_by_group[$target_group]+=",$target_network"
+      fi
     done
-    if [[ "${#target_cidrs[@]}" -gt 0 ]]; then
-      write_daemonset "$source_node" "$source_group" "${target_cidrs[@]}"
+    for target_group in "${target_groups[@]}"; do
+      if ! target_latency="$(link_for_pair "$source_group" "$target_group")"; then
+        echo "invalid ZONE_LINKS rule for $source_group>$target_group" >&2
+        return 1
+      fi
+      target_specs+=("$target_latency|${networks_by_group[$target_group]}")
+    done
+    if [[ "${#target_specs[@]}" -gt 15 ]]; then
+      echo "node $source_node reaches more than 15 target zones; tc prio supports at most 16 bands" >&2
+      return 1
+    fi
+    if [[ "${#target_specs[@]}" -gt 0 ]]; then
+      write_daemonset "$source_node" "$source_group" "${target_specs[@]}"
     fi
   done
 }

@@ -21,13 +21,12 @@ bandwidth limits, and packet loss to Kubernetes node traffic.
 | `NETWORK_INTERFACE` | `flannel.1` | Interface carrying remote PodCIDR traffic |
 | `HOST_NETWORK` | `false` | Target cross-group node InternalIPs (`/32`) instead of PodCIDRs |
 | `ENABLE_LATENCY` | `true` | Enable latency |
-| `CROSS_ZONE_LATENCY` | `50ms` | One-way cross-group delay |
-| `JITTER` | `0ms` | Delay variation |
-| `CORRELATION` | `0` | Delay correlation percentage |
+| `DEFAULT_CROSS_ZONE_LATENCY` | `50ms` | Default one-way cross-group delay |
+| `ZONE_LINKS` | empty | Directed per-zone overrides encoded as `from>to=latency;bandwidthBytesPerSecond;packetLoss` |
 | `ENABLE_BANDWIDTH` | `false` | Enable bandwidth limiting |
-| `CROSS_ZONE_BANDWIDTH_BYTES_PER_SECOND` | empty | Bandwidth limit in bytes per second (`tc`'s `bps` suffix means bytes/s) |
+| `DEFAULT_CROSS_ZONE_BANDWIDTH_BYTES_PER_SECOND` | empty | Default bandwidth limit in bytes per second (`tc`'s `bps` suffix means bytes/s) |
 | `ENABLE_PACKET_LOSS` | `false` | Enable packet loss |
-| `PACKET_LOSS` | `0` | Packet-loss percentage |
+| `DEFAULT_CROSS_ZONE_PACKET_LOSS` | `0` | Default packet-loss percentage |
 | `CHAOS_NAMESPACE` | `chaos-mesh` | DaemonSet namespace |
 | `CHAOS_DAEMON_IMAGE` | built-in | Shaper container image |
 | `CHAOS_MANIFEST` | beside script | Default generated manifest |
@@ -35,6 +34,15 @@ bandwidth limits, and packet loss to Kubernetes node traffic.
 
 Selected nodes need an InternalIP, PodCIDR, and `NODE_GROUP_LABEL`. Deleting the
 manifest removes the installed traffic-control rules.
+
+`ZONE_LINKS` rules are directional. For example,
+`cloud>fog=20ms;12500000;0.1` customizes all supported impairments. Leave a
+field empty to inherit its corresponding `DEFAULT_CROSS_ZONE_*` value.
+Unlisted pairs inherit every global default. The injector creates a separate
+netem class per destination zone.
+The `ENABLE_LATENCY`, `ENABLE_BANDWIDTH`, and `ENABLE_PACKET_LOSS` switches
+remain feature-level gates; an override for a disabled impairment is retained
+in configuration but is not applied.
 
 For pods using `hostNetwork: true`, set `HOST_NETWORK=true` and select the host
 interface (for example, `NETWORK_INTERFACE=eth0`). This targets the InternalIPs
