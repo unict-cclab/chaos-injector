@@ -45,6 +45,12 @@ grep -q 'delay 15ms' <<<"$app_01"
 grep -q 'delay 80ms' <<<"$app_01"
 grep -q 'rate 2500000bps' <<<"$app_01"
 grep -q 'loss 0.5%' <<<"$app_01"
+# Latency, bandwidth, and loss share the filtered shaped bands. The explicit
+# all-zero priomap above guarantees unmatched/same-zone traffic uses band 1.
+if grep -qE 'match ip dst "10\.42\.[12]\.0/24"' <<<"$app_01"; then
+  echo "app-01 shaper unexpectedly classifies same-zone traffic" >&2
+  exit 1
+fi
 grep -q 'rate 1250000bps' <<<"$app_01"
 if grep -qE '10\.42\.[12]\.0/24' <<<"$app_01"; then
   echo "app-01 shaper unexpectedly targets a same-zone PodCIDR" >&2
