@@ -78,4 +78,33 @@ if grep -q '10.42.' <<<"$host_app_01"; then
   exit 1
 fi
 
+grep -q 'trap cleanup EXIT' "$manifest"
+grep -q 'owns_qdisc=true' "$manifest"
+
+invalid_manifest="$tmp_dir/invalid.yaml"
+if KUBECTL="$fake_kubectl" \
+  ENABLE_PACKET_LOSS=true \
+  DEFAULT_CROSS_ZONE_PACKET_LOSS=100.1 \
+  "$repo_dir/chaos-injector.sh" generate "$invalid_manifest" >/dev/null 2>&1; then
+  echo "generator accepted packet loss above 100 percent" >&2
+  exit 1
+fi
+[[ ! -e "$invalid_manifest" ]]
+
+if KUBECTL="$fake_kubectl" \
+  ZONE_LINKS='zone-a>zone-b=10ms;invalid;1' \
+  "$repo_dir/chaos-injector.sh" generate "$invalid_manifest" >/dev/null 2>&1; then
+  echo "generator accepted an invalid zone bandwidth override" >&2
+  exit 1
+fi
+[[ ! -e "$invalid_manifest" ]]
+
+if KUBECTL="$fake_kubectl" \
+  ZONE_LINKS='zone-a>zone-missing=10ms;;1' \
+  "$repo_dir/chaos-injector.sh" generate "$invalid_manifest" >/dev/null 2>&1; then
+  echo "generator accepted a zone override for an unselected group" >&2
+  exit 1
+fi
+[[ ! -e "$invalid_manifest" ]]
+
 echo "generate_test: PASS"

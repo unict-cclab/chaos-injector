@@ -45,6 +45,22 @@ The `ENABLE_LATENCY`, `ENABLE_BANDWIDTH`, and `ENABLE_PACKET_LOSS` switches
 remain feature-level gates; an override for a disabled impairment is retained
 in configuration but is not applied.
 
+Latency values must be positive `tc` durations using `us`, `ms`, or `s`.
+Bandwidth values are positive decimal byte rates, and packet loss is a number
+from 0 through 100 with an optional `%` suffix. Generation fails before a
+manifest is installed if defaults or per-zone overrides are invalid.
+
+All enabled properties for a destination zone are composed in one `netem`
+qdisc. The bandwidth ceiling is shared by all matching flows from one source
+node to that destination zone; it is not a cluster-wide zone-to-zone ceiling.
+Delay is one-way, so a symmetric setting is observed twice in an ICMP RTT.
+Likewise, loss configured in both directions can affect both the request and
+reply, and TCP throughput under loss can be lower than the configured rate.
+The classifier uses strict-priority bands, with unshaped traffic first. Avoid
+saturating the underlying interface during a measurement: sustained traffic
+in an earlier band can delay a later destination-zone band independently of
+its configured `netem` properties.
+
 For pods using `hostNetwork: true`, set `HOST_NETWORK=true` and select the host
 interface (for example, `NETWORK_INTERFACE=eth0`). This targets the InternalIPs
 of nodes in other groups. Host-interface shaping can also affect unrelated

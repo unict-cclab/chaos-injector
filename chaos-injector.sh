@@ -75,6 +75,89 @@ bool_value() {
   fi
 }
 
+is_positive_decimal() {
+  [[ "$1" =~ ^([1-9][0-9]*([.][0-9]+)?|0[.][0-9]*[1-9][0-9]*)$ ]]
+}
+
+validate_latency() {
+  local value="$1"
+  [[ "$value" =~ ^([0-9]+([.][0-9]+)?)(us|ms|s)$ ]] && [[ "${BASH_REMATCH[1]}" =~ [1-9] ]]
+}
+
+validate_packet_loss() {
+  local value="${1%\%}" whole fraction
+  [[ "$value" =~ ^([0-9]+([.][0-9]+)?|[.][0-9]+)$ ]] || return 1
+  whole="${value%%.*}"
+  [[ -n "$whole" ]] || whole=0
+  while [[ "${#whole}" -gt 1 && "${whole:0:1}" == 0 ]]; do
+    whole="${whole:1}"
+  done
+  if [[ "${#whole}" -lt 3 ]]; then
+    return 0
+  fi
+  [[ "${#whole}" -eq 3 && "$whole" == 100 ]] || return 1
+  if [[ "$value" == *.* ]]; then
+    fraction="${value#*.}"
+    [[ ! "$fraction" =~ [1-9] ]]
+  fi
+}
+
+validate_zone_links() {
+  local rule pair properties source_group target_group latency bandwidth packet_loss extra
+  local -A seen_pairs=()
+  local -a rules
+  [[ -n "$zone_links" ]] || return 0
+  IFS=',' read -ra rules <<<"$zone_links"
+  for rule in "${rules[@]}"; do
+    [[ "$rule" == *=* ]] || {
+      echo "invalid ZONE_LINKS rule (missing '='): $rule" >&2
+      return 1
+    }
+    pair="${rule%%=*}"
+    properties="${rule#*=}"
+    [[ "$pair" == *\>* && "$pair" != *\>*\>* ]] || {
+      echo "invalid ZONE_LINKS zone pair: $pair" >&2
+      return 1
+    }
+    source_group="${pair%%>*}"
+    target_group="${pair#*>}"
+    [[ -n "$source_group" && -n "$target_group" && "$source_group" != "$target_group" ]] || {
+      echo "invalid ZONE_LINKS zone pair: $pair" >&2
+      return 1
+    }
+    [[ -n "${selected_groups[$source_group]+x}" ]] || {
+      echo "ZONE_LINKS source group is not selected: $source_group" >&2
+      return 1
+    }
+    [[ -n "${selected_groups[$target_group]+x}" ]] || {
+      echo "ZONE_LINKS target group is not selected: $target_group" >&2
+      return 1
+    }
+    [[ -z "${seen_pairs[$pair]+x}" ]] || {
+      echo "duplicate ZONE_LINKS zone pair: $pair" >&2
+      return 1
+    }
+    seen_pairs[$pair]=1
+    IFS=';' read -r latency bandwidth packet_loss extra <<<"$properties;"
+    [[ -z "$extra" ]] || {
+      echo "invalid ZONE_LINKS properties for $pair" >&2
+      return 1
+    }
+    if [[ -n "$latency" ]] && ! validate_latency "$latency"; then
+      echo "invalid latency for $pair: $latency" >&2
+      return 1
+    fi
+    if [[ -n "$bandwidth" ]] && ! is_positive_decimal "$bandwidth"; then
+      echo "invalid bandwidth for $pair: $bandwidth" >&2
+      return 1
+    fi
+    if [[ -n "$packet_loss" ]] && ! validate_packet_loss "$packet_loss"; then
+      echo "invalid packet loss for $pair: $packet_loss" >&2
+      return 1
+    fi
+  done
+}
+
 resource_name() {
   local name hash
   name="$(sanitize_name "$1")"
@@ -167,31 +250,34 @@ spec:
           args:
             - |
               host() { nsenter -t 1 -n -- "\$@"; }
+              owns_qdisc=false
               cleanup() {
-                if host tc qdisc show dev "\$NETWORK_INTERFACE" | grep -q '^qdisc prio 1:'; then
+                if [ "\$owns_qdisc" = "true" ] && host tc qdisc show dev "\$NETWORK_INTERFACE" | grep -q '^qdisc prio 1:'; then
                   host tc qdisc del dev "\$NETWORK_INTERFACE" root 2>/dev/null || true
                 fi
               }
-              cleanup_and_exit() {
-                cleanup
-                exit 0
-              }
-              trap cleanup_and_exit INT TERM
+              trap cleanup EXIT
+              trap 'exit 0' INT TERM
               existing_qdisc="\$(host tc qdisc show dev "\$NETWORK_INTERFACE")"
               case "\$existing_qdisc" in
-                *"qdisc noqueue 0:"*|*"qdisc prio 1:"*) ;;
+                *"qdisc noqueue 0:"*) ;;
+                *"qdisc prio 1:"*)
+                  owns_qdisc=true
+                  cleanup
+                  owns_qdisc=false
+                  ;;
                 *)
                   echo "refusing to replace existing qdisc on \$NETWORK_INTERFACE: \$existing_qdisc" >&2
                   exit 1
                   ;;
               esac
-              cleanup
               # Keep all unmatched traffic (including same-zone traffic) in
               # unshaped band 1. Destination filters below explicitly direct
               # cross-zone traffic into shaped bands 2..N.
               host tc qdisc add dev "\$NETWORK_INTERFACE" root handle 1: prio \
                 bands $((${#target_specs[@]} + 1)) \
                 priomap 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+              owns_qdisc=true
 EOF
   local spec latency bandwidth rule_packet_loss cidrs cidr band=2 handle=20
   for spec in "${target_specs[@]}"; do
@@ -243,7 +329,7 @@ write_manifest() {
   local source_entry source_node source_group
   local target_entry target_node target_ip target_cidr target_group target_network target_latency
   local -a nodes target_specs target_groups
-  local -A networks_by_group
+  local -A networks_by_group selected_groups
 
   node_template='{{range .items}}{{.metadata.name}}{{"\t"}}{{range .status.addresses}}{{if eq .type "InternalIP"}}{{.address}}{{end}}{{end}}{{"\t"}}{{.spec.podCIDR}}{{"\t"}}{{index .metadata.labels "'"$node_group_label"'"}}{{"\n"}}{{end}}'
   local selector_args=()
@@ -274,7 +360,12 @@ write_manifest() {
       echo "node $node_name is missing label $node_group_label" >&2
       return 1
     fi
+    selected_groups[$node_group]=1
   done
+  if [[ "${#selected_groups[@]}" -lt 2 ]]; then
+    echo "expected selected Kubernetes nodes in at least two groups" >&2
+    return 1
+  fi
 
   echo "# Generated by chaos-injector/chaos-injector.sh"
   echo "# Node groups: $node_group_label"
@@ -294,15 +385,30 @@ write_manifest() {
     echo "at least one of ENABLE_LATENCY, ENABLE_BANDWIDTH, or ENABLE_PACKET_LOSS must be true" >&2
     return 1
   fi
+  if ! [[ "$network_interface" =~ ^[a-zA-Z0-9_.:@-]{1,15}$ ]]; then
+    echo "NETWORK_INTERFACE must be a valid Linux interface name" >&2
+    return 1
+  fi
+  if ! validate_latency "$default_cross_zone_latency"; then
+    echo "DEFAULT_CROSS_ZONE_LATENCY must be a positive tc duration using us, ms, or s" >&2
+    return 1
+  fi
+  if ! validate_packet_loss "$default_cross_zone_packet_loss"; then
+    echo "DEFAULT_CROSS_ZONE_PACKET_LOSS must be a percentage from 0 to 100" >&2
+    return 1
+  fi
   if [[ "$enable_bandwidth" == "true" ]]; then
     if [[ -z "$default_cross_zone_bandwidth_bytes_per_second" ]]; then
       echo "DEFAULT_CROSS_ZONE_BANDWIDTH_BYTES_PER_SECOND is required when ENABLE_BANDWIDTH=true" >&2
       return 1
     fi
-    if ! [[ "$default_cross_zone_bandwidth_bytes_per_second" =~ ^([1-9][0-9]*([.][0-9]+)?|0[.][0-9]*[1-9][0-9]*)$ ]]; then
-      echo "DEFAULT_CROSS_ZONE_BANDWIDTH_BYTES_PER_SECOND must be a positive numeric bytes-per-second value" >&2
-      return 1
-    fi
+  fi
+  if [[ -n "$default_cross_zone_bandwidth_bytes_per_second" ]] && ! is_positive_decimal "$default_cross_zone_bandwidth_bytes_per_second"; then
+    echo "DEFAULT_CROSS_ZONE_BANDWIDTH_BYTES_PER_SECOND must be a positive numeric bytes-per-second value" >&2
+    return 1
+  fi
+  if ! validate_zone_links; then
+    return 1
   fi
 
   for source_entry in "${nodes[@]}"; do
@@ -330,6 +436,11 @@ write_manifest() {
     for target_group in "${target_groups[@]}"; do
       if ! target_latency="$(link_for_pair "$source_group" "$target_group")"; then
         echo "invalid ZONE_LINKS rule for $source_group>$target_group" >&2
+        return 1
+      fi
+      IFS='|' read -r latency bandwidth rule_packet_loss <<<"$target_latency"
+      if [[ "$enable_bandwidth" == "true" && -z "$bandwidth" ]]; then
+        echo "bandwidth is required for $source_group>$target_group when ENABLE_BANDWIDTH=true" >&2
         return 1
       fi
       target_specs+=("$target_latency|${networks_by_group[$target_group]}")
